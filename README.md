@@ -43,6 +43,8 @@ We encourage the security community to:
 
 BadSuccessor exploits a privilege escalation vulnerability in Windows Server 2025's delegated Managed Service Account (dMSA) feature. The vulnerability allows attackers with minimal permissions to escalate privileges to any user in the domain, including Domain Administrators.
 
+**Patch status:** Tracked as **CVE-2025-53779** (CVSS 7.2, relative path traversal in dMSA). Disclosed by Akamai on 2025-05-21 and fixed in Microsoft's **August 2025 Patch Tuesday**. Akamai notes the patch mitigates a significant part of the risk but the underlying technique stays relevant, so this tool remains useful against unpatched or misconfigured Windows Server 2025 environments.
+
 ### Research Credit
 
 This tool is based on the excellent research by **Yuval Gordon** from **Akamai Technologies**:
@@ -62,7 +64,7 @@ Additionally, the KERB-DMSA-KEY-PACKAGE structure contains the target user's pas
 
 ### System Requirements
 - Linux machine (non-domain joined)
-- Python 3.6+
+- Python 3.8+ (developed and tested on 3.14)
 - Network access to target Active Directory environment
 - Target domain must have at least one Windows Server 2025 Domain Controller
 
@@ -72,7 +74,7 @@ pip3 install ldap3 pyasn1 pycryptodome
 pip3 install impacket==0.12.0
 ```
 
-**Note**: The tool has been tested with impacket 0.12.0. Version compatibility warnings are displayed at runtime.
+**Note**: The tool targets impacket 0.12.0 and also runs on newer releases (tested with 0.13.1). A version-mismatch warning is printed at runtime but can be ignored on supported newer versions.
 
 ### Optional Dependencies
 ```bash
@@ -113,6 +115,15 @@ pyasn1>=0.4.8
 pycryptodome>=3.15.0
 impacket==0.12.0
 dnspython>=2.1.0
+```
+
+## 🧪 Testing
+
+Unit tests cover the DACL/ACE parsing, the GUID helper, and session handling. They need no live Active Directory.
+
+```bash
+pip3 install impacket   # test dependency
+python3 -m unittest discover -s tests
 ```
 
 ## 📖 Usage
@@ -181,7 +192,7 @@ python3 badsuccessor.py -d corp.local -u john -p Password123 --auto-pwn
 python3 badsuccessor.py -d corp.local -u john -p Password123 --list-sessions
 
 # Resume a previous session
-python3 badsuccessor.py -d corp.local -u john -p Password123 --session-id corp.local_john_1234567890_abcd1234
+python3 badsuccessor.py -d corp.local -u john -p Password123 --session-id corp_local_john_1234567890_abcd1234
 
 # Clean up all dMSAs from a session
 python3 badsuccessor.py -d corp.local -u john -p Password123 --cleanup-session SESSION_ID
@@ -302,7 +313,7 @@ The tool provides ready-to-use commands for:
 - Lateral movement
 - Persistence establishment
 
-## 🔐 Production-Ready Features (v3.0.0)
+## 🔐 Key Features
 
 ### Dynamic Schema Detection (NEW)
 - Automatically detects which attribute naming convention your environment uses
@@ -319,7 +330,7 @@ The tool provides ready-to-use commands for:
 - Persistent session tracking across operations
 - Resume interrupted attacks
 - Bulk cleanup of all created dMSAs
-- Session files stored securely with 0700 permissions
+- Session files stored as JSON (not pickle) in a per-user state directory (`$XDG_STATE_HOME/badsuccessor/sessions`, default `~/.local/state/badsuccessor/sessions`), written `0600`, with session ids sanitized against path traversal
 
 ### Dry Run Mode (NEW)
 - Test attack viability without making any changes
@@ -346,10 +357,9 @@ The tool provides ready-to-use commands for:
 - Verbose mode for troubleshooting
 
 ### Complete Implementation
-- All features fully implemented (no placeholder code)
-- Production-tested code structure
 - Modular design with specialized classes
-- Full compatibility with various AD configurations
+- Works across varied AD configurations via dynamic schema detection
+- Note: the S4U2Self fallback in `KerberosAuthenticator` is a stub and not yet implemented
 
 ## 🛡️ Detection
 
@@ -413,7 +423,7 @@ detection:
    - Track dMSA creation patterns
 
 ### Long-term Solutions
-- Apply Microsoft patches when available
+- Apply the Microsoft patch for CVE-2025-53779 (August 2025 Patch Tuesday); follow Microsoft's manual steps to create a dedicated service principal for the hybrid connection
 - Regular permission audits (check ALL write permissions, not just CreateChild)
 - Principle of least privilege enforcement
 - Consider disabling dMSA if not required
@@ -425,7 +435,7 @@ Based on Akamai's research:
 - **91%** of environments have vulnerable permissions
 - Works on **default configurations**
 - Affects organizations with Windows Server 2025 DCs
-- No patches currently available
+- Patched by Microsoft in August 2025 (CVE-2025-53779); still relevant against unpatched/misconfigured environments
 
 ## 🏗️ Technical Implementation Details
 
@@ -470,7 +480,16 @@ Contributions are welcome! Please:
 
 ## 📝 Changelog
 
-### v2.3.0 (2025-05-28) - Production Ready Release
+### Unreleased - Correctness & safety fixes
+- **FIXED**: OU permission scan now detects `ACCESS_ALLOWED_OBJECT_ACE` (object ACEs), including `CreateChild` scoped to the dMSA class — the exact BadSuccessor primitive, which was previously missed entirely.
+- **FIXED**: dMSA schema GUID (was the gMSA GUID); now read from the live schema `schemaIDGUID` with a correct constant fallback.
+- **FIXED**: replaced the removed `ldaptypes.bin_to_string` call that silently broke DACL parsing on impacket 0.12+.
+- **FIXED**: malformed service-account LDAP filter (spaces after `&`) that AD rejected.
+- **FIXED**: `pkg_resources` (removed on Python 3.12+) replaced with `importlib.metadata`.
+- **SECURITY**: session state is JSON, not pickle; stored per-user in `~/.local/state/badsuccessor/sessions` at `0600`, with path-traversal-safe session ids.
+- **NEW**: unit tests under `tests/`.
+
+### v2.3.0 (2025-05-28) - Feature Release
 - **NEW**: Dry run mode for safe attack simulation
 - **NEW**: Comprehensive session management with state persistence
 - **NEW**: Target account validation with detailed analysis
@@ -485,7 +504,6 @@ Contributions are welcome! Please:
 - **NEW**: Professional error handling and logging
 - **IMPROVED**: Complete modular architecture
 - **IMPROVED**: Version checking for dependencies
-- **FIXED**: All placeholder code replaced with full implementations
 
 ### v2.2.0 (2025-05-27) - Compatibility Update
 - **FIXED**: Resolved impacket import issues (removed seq_decode dependency)
@@ -519,6 +537,7 @@ Contributions are welcome! Please:
 ## 📚 References
 
 - [Original Akamai Research](https://www.akamai.com/blog/security-research/abusing-dmsa-for-privilege-escalation-in-active-directory)
+- [CVE-2025-53779 (MSRC)](https://msrc.microsoft.com/update-guide/vulnerability/CVE-2025-53779)
 - [GitHub Issue #1 - Enhanced Permission Checking](https://github.com/cybrly/badsuccessor/issues/1)
 - [GitHub Issue #2 - Schema Attribute Naming](https://github.com/cybrly/badsuccessor/issues/2)
 - [Microsoft Security Response Center](https://msrc.microsoft.com/)
@@ -565,8 +584,8 @@ python3 badsuccessor.py -d corp.local -u john -p Password123 --enumerate --verbo
 # List sessions
 python3 badsuccessor.py -d corp.local -u john -p Password123 --list-sessions
 
-# Clean up stale sessions
-rm -rf /tmp/.badsuccessor_sessions/
+# Clean up stale sessions (per-user state dir)
+rm -rf ~/.local/state/badsuccessor/sessions/
 ```
 
 ## 📧 Contact
